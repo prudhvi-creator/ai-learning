@@ -23,15 +23,15 @@ import { useFirestoreSync } from './hooks/useFirestoreSync';
 import './App.css';
 
 export function App() {
-  const { isLoading, isAuthenticated } = useFirestoreSync();
+  const { isLoading, isAuthenticated, syncError, retrySync } = useFirestoreSync();
   const { checkStreak } = useProgressStore();
   const { theme } = useSettingsStore();
 
   useEffect(() => {
-    if (isAuthenticated) {
+    if (isAuthenticated && !isLoading) {
       checkStreak();
     }
-  }, [isAuthenticated, checkStreak]);
+  }, [isAuthenticated, isLoading, checkStreak]);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
@@ -41,6 +41,17 @@ export function App() {
       document.body.classList.remove('light');
     }
   }, [theme]);
+
+  if (syncError) {
+    return (
+      <div className="min-h-screen bg-dark-bg text-slate-100 flex flex-col items-center justify-center gap-4 p-6" role="alert">
+        <h1 className="text-xl font-bold">Unable to load your progress</h1>
+        <p>{syncError}</p>
+        <p className="text-sm text-slate-400">Cloud updates are paused to protect your saved data.</p>
+        <button onClick={retrySync} className="btn-primary">Retry loading</button>
+      </div>
+    );
+  }
 
   // Loading Screen while Firebase Auth resolves
   if (isLoading) {

@@ -1,8 +1,11 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { db, auth } from '../lib/firebase';
-import type { UserProgress } from '../types/progress';
+import { doc, getDocFromServer, setDoc } from 'firebase/firestore';
+import { db, auth } from '../lib/firebase.ts';
+import { createCloudSession } from '../lib/cloudSession.ts';
+
+const cloudSession = createCloudSession(() => auth.currentUser?.uid);
+import type { UserProgress } from '../types/progress.ts';
 
 interface ProgressStore extends UserProgress {
   completeLesson: (lessonId: string, moduleId: string) => void;
@@ -13,8 +16,9 @@ interface ProgressStore extends UserProgress {
   checkStreak: () => void;
   addWeakArea: (moduleId: string) => void;
   removeWeakArea: (moduleId: string) => void;
-  resetProgress: () => void;
+  resetProgress: (syncCloud?: boolean) => void;
   loadFromFirestore: (uid: string) => Promise<void>;
+  cancelCloudSync: () => void;
   syncToFirestore: () => Promise<void>;
 }
 
@@ -48,25 +52,46 @@ export const calculateTotalXP = (
 const localDate = (date: Date) =>
   `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 
-const syncProgressToFirestore = async (state: UserProgress) => {
+export const sanitizeProgress = (state?: Partial<UserProgress> | null): UserProgress => {
+  const safeState = state || {};
+  const lessonsCompleted = Array.isArray(safeState.lessonsCompleted) ? safeState.lessonsCompleted : [];
+  const projectsCompleted = Array.isArray(safeState.projectsCompleted) ? safeState.projectsCompleted : [];
+  const quizScores: Record<string, number> = {};
+  if (safeState.quizScores && typeof safeState.quizScores === 'object') {
+    for (const [k, v] of Object.entries(safeState.quizScores)) {
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        quizScores[k] = Math.max(0, Math.min(100, v));
+      }
+    }
+  }
+  const xp = typeof safeState.xp === 'number' && Number.isFinite(safeState.xp)
+    ? safeState.xp
+    : calculateTotalXP(lessonsCompleted, projectsCompleted, quizScores);
+  const level = levelForXP(xp);
+
+  return {
+    lessonsCompleted,
+    quizScores,
+    projectsCompleted,
+    streak: typeof safeState.streak === 'number' ? Math.max(0, safeState.streak) : 0,
+    lastActiveDate: typeof safeState.lastActiveDate === 'string' ? safeState.lastActiveDate : '',
+    currentModuleId: typeof safeState.currentModuleId === 'string' ? safeState.currentModuleId : 'foundations',
+    currentLessonId: typeof safeState.currentLessonId === 'string' ? safeState.currentLessonId : 'what-is-programming',
+    timeSpentMinutes: typeof safeState.timeSpentMinutes === 'number' ? Math.max(0, safeState.timeSpentMinutes) : 0,
+    weakAreas: Array.isArray(safeState.weakAreas) ? safeState.weakAreas : [],
+    xp,
+    level,
+  };
+};
+
+const syncProgressToFirestore = async (state?: Partial<UserProgress>) => {
   const uid = auth.currentUser?.uid;
-  if (!uid) return;
+  if (!uid || !cloudSession.canWrite(uid)) return;
   try {
     const userDocRef = doc(db, 'users', uid);
-    const dataToSave: UserProgress = {
-      lessonsCompleted: state.lessonsCompleted,
-      quizScores: state.quizScores,
-      projectsCompleted: state.projectsCompleted,
-      streak: state.streak,
-      lastActiveDate: state.lastActiveDate,
-      currentModuleId: state.currentModuleId,
-      currentLessonId: state.currentLessonId,
-      timeSpentMinutes: state.timeSpentMinutes,
-      weakAreas: state.weakAreas,
-      xp: state.xp,
-      level: state.level,
-    };
-    await setDoc(userDocRef, { progress: dataToSave, lastSyncedAt: new Date().toISOString() }, { merge: true });
+    const current = useProgressStore.getState();
+    const dataToSave = sanitizeProgress({ ...current, ...(state || {}) });
+    await setDoc(userDocRef, { progress: dataToSave, lastSyncedAt: new Date().toISOString() }, { mergeFields: ['progress', 'lastSyncedAt'] });
   } catch (error) {
     console.warn('Firestore sync warning (data still saved locally):', error);
   }
@@ -92,7 +117,7 @@ export const useProgressStore = create<ProgressStore>()(
             currentModuleId: moduleId,
           };
           set(updated);
-          syncProgressToFirestore({ ...get(), ...updated });
+          syncProgressToFirestore(updated);
         }
       },
 
@@ -111,7 +136,7 @@ export const useProgressStore = create<ProgressStore>()(
           level: levelForXP(nextXP),
         };
         set(updated);
-        syncProgressToFirestore({ ...get(), ...updated });
+        syncProgressToFirestore(updated);
       },
 
       completeProject: (projectId) => {
@@ -127,7 +152,7 @@ export const useProgressStore = create<ProgressStore>()(
             level: nextLevel,
           };
           set(updated);
-          syncProgressToFirestore({ ...get(), ...updated });
+          syncProgressToFirestore(updated);
         }
       },
 
@@ -135,12 +160,12 @@ export const useProgressStore = create<ProgressStore>()(
         if (!minutes || minutes <= 0) return;
         const nextMinutes = get().timeSpentMinutes + minutes;
         set({ timeSpentMinutes: nextMinutes });
-        syncProgressToFirestore({ ...get(), timeSpentMinutes: nextMinutes });
+        syncProgressToFirestore({ timeSpentMinutes: nextMinutes });
       },
 
       setCurrentLesson: (lessonId, moduleId) => {
         set({ currentLessonId: lessonId, currentModuleId: moduleId });
-        syncProgressToFirestore({ ...get(), currentLessonId: lessonId, currentModuleId: moduleId });
+        syncProgressToFirestore({ currentLessonId: lessonId, currentModuleId: moduleId });
       },
 
       checkStreak: () => {
@@ -154,7 +179,7 @@ export const useProgressStore = create<ProgressStore>()(
         const newStreak = state.lastActiveDate === yesterday ? state.streak + 1 : 1;
         const updated = { streak: newStreak, lastActiveDate: today };
         set(updated);
-        syncProgressToFirestore({ ...get(), ...updated });
+        syncProgressToFirestore(updated);
       },
 
       addWeakArea: (moduleId) => {
@@ -162,7 +187,7 @@ export const useProgressStore = create<ProgressStore>()(
         if (!state.weakAreas.includes(moduleId)) {
           const nextWeakAreas = [...state.weakAreas, moduleId];
           set({ weakAreas: nextWeakAreas });
-          syncProgressToFirestore({ ...get(), weakAreas: nextWeakAreas });
+          syncProgressToFirestore({ weakAreas: nextWeakAreas });
         }
       },
 
@@ -170,75 +195,56 @@ export const useProgressStore = create<ProgressStore>()(
         const state = get();
         const nextWeakAreas = state.weakAreas.filter((id) => id !== moduleId);
         set({ weakAreas: nextWeakAreas });
-        syncProgressToFirestore({ ...get(), weakAreas: nextWeakAreas });
+        syncProgressToFirestore({ weakAreas: nextWeakAreas });
       },
 
-      resetProgress: () => {
+      resetProgress: (syncCloud = false) => {
+        if (!syncCloud) cloudSession.invalidate();
         set(defaultProgress);
-        syncProgressToFirestore(defaultProgress);
+        if (syncCloud) {
+          syncProgressToFirestore(defaultProgress);
+        }
       },
 
       syncToFirestore: async () => {
         await syncProgressToFirestore(get());
       },
 
+      cancelCloudSync: () => cloudSession.invalidate(),
+
       loadFromFirestore: async (uid: string) => {
+        const request = cloudSession.beginLoad(uid);
         try {
+          if (!request.isCurrent()) return;
           const userDocRef = doc(db, 'users', uid);
-          const snap = await getDoc(userDocRef);
-          const localState = get();
+          const snap = await getDocFromServer(userDocRef);
+          if (!request.isCurrent()) return;
 
           if (snap.exists()) {
             const data = snap.data();
-            const cloudProgress = (data.progress || {}) as Partial<UserProgress>;
-
-            // Merge local and cloud data smartly (union of completed items, max scores)
-            const lessonsCompleted = Array.from(
-              new Set([...(localState.lessonsCompleted || []), ...(cloudProgress.lessonsCompleted || [])])
-            );
-            const projectsCompleted = Array.from(
-              new Set([...(localState.projectsCompleted || []), ...(cloudProgress.projectsCompleted || [])])
-            );
+            const rawProgress = (data?.progress && typeof data.progress === 'object')
+              ? data.progress
+              : data;
+            const cloudProgress = sanitizeProgress(rawProgress as Partial<UserProgress>);
             
-            const quizScores: Record<string, number> = {
-              ...(localState.quizScores || {}),
-              ...(cloudProgress.quizScores || {}),
-            };
-            if (cloudProgress.quizScores) {
-              for (const [k, v] of Object.entries(cloudProgress.quizScores)) {
-                quizScores[k] = Math.max(quizScores[k] ?? 0, v);
-              }
-            }
+            // Ensure XP and level reflect the loaded completion data
+            const calculatedXP = calculateTotalXP(
+              cloudProgress.lessonsCompleted,
+              cloudProgress.projectsCompleted,
+              cloudProgress.quizScores
+            );
+            cloudProgress.xp = Math.max(cloudProgress.xp, calculatedXP);
+            cloudProgress.level = levelForXP(cloudProgress.xp);
 
-            const totalXP = calculateTotalXP(lessonsCompleted, projectsCompleted, quizScores);
-            const finalXP = Math.max(totalXP, localState.xp || 0, cloudProgress.xp || 0);
-
-            const merged: UserProgress = {
-              lessonsCompleted,
-              projectsCompleted,
-              quizScores,
-              streak: Math.max(localState.streak || 0, cloudProgress.streak || 0),
-              lastActiveDate: cloudProgress.lastActiveDate || localState.lastActiveDate || '',
-              currentModuleId: cloudProgress.currentModuleId || localState.currentModuleId || 'foundations',
-              currentLessonId: cloudProgress.currentLessonId || localState.currentLessonId || 'what-is-programming',
-              timeSpentMinutes: Math.max(localState.timeSpentMinutes || 0, cloudProgress.timeSpentMinutes || 0),
-              weakAreas: Array.from(
-                new Set([...(localState.weakAreas || []), ...(cloudProgress.weakAreas || [])])
-              ),
-              xp: finalXP,
-              level: levelForXP(finalXP),
-            };
-
-            set(merged);
-            // Write back merged progress to ensure cloud and local are fully in sync
-            await setDoc(userDocRef, { progress: merged, lastSyncedAt: new Date().toISOString() }, { merge: true });
+            set(cloudProgress);
           } else {
-            // First time cloud user, push local progress to Firestore
-            const initial = get();
-            await setDoc(userDocRef, { progress: initial, lastSyncedAt: new Date().toISOString() }, { merge: true });
+            // New cloud account: initialize clean progress
+            const clean = sanitizeProgress(defaultProgress);
+            set(clean);
           }
+          request.complete();
         } catch (error) {
-          console.warn('Could not load progress from Firestore (using local storage):', error);
+          if (request.isCurrent()) throw error;
         }
       },
     }),

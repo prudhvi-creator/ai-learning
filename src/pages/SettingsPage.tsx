@@ -29,7 +29,7 @@ export const SettingsPage: React.FC = () => {
   };
 
   const handleReset = () => {
-    resetProgress();
+    resetProgress(true);
     setResetConfirm(false);
   };
 

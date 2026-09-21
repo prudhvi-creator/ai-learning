@@ -1,8 +1,11 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { db, auth } from '../lib/firebase';
-import type { UserSettings } from '../types/progress';
+import { doc, getDocFromServer, setDoc } from 'firebase/firestore';
+import { db, auth } from '../lib/firebase.ts';
+import { createCloudSession } from '../lib/cloudSession.ts';
+
+const cloudSession = createCloudSession(() => auth.currentUser?.uid);
+import type { UserSettings } from '../types/progress.ts';
 
 interface SettingsStore extends UserSettings {
   setTheme: (theme: 'dark' | 'light') => void;
@@ -13,7 +16,8 @@ interface SettingsStore extends UserSettings {
   setUserName: (name: string) => void;
   toggleNotifications: () => void;
   loadFromFirestore: (uid: string) => Promise<void>;
-  resetSettings: () => void;
+  cancelCloudSync: () => void;
+  resetSettings: (syncCloud?: boolean) => void;
   syncToFirestore: () => Promise<void>;
 }
 
@@ -26,14 +30,28 @@ const defaultSettings: UserSettings = {
   userName: 'Learner',
 };
 
-const syncSettingsToFirestore = async (state: UserSettings) => {
+export const sanitizeSettings = (state?: Partial<UserSettings> | null): UserSettings => {
+  const safe = state || {};
+  return {
+    theme: safe.theme === 'light' ? 'light' : 'dark',
+    beginnerMode: safe.beginnerMode ?? defaultSettings.beginnerMode,
+    dailyGoalMinutes: typeof safe.dailyGoalMinutes === 'number' && Number.isFinite(safe.dailyGoalMinutes) ? safe.dailyGoalMinutes : defaultSettings.dailyGoalMinutes,
+    notifications: safe.notifications ?? defaultSettings.notifications,
+    fontSize: safe.fontSize === 'sm' || safe.fontSize === 'lg' ? safe.fontSize : 'md',
+    userName: typeof safe.userName === 'string' && safe.userName.trim() ? safe.userName : defaultSettings.userName,
+  };
+};
+
+const syncSettingsToFirestore = async (state?: Partial<UserSettings>) => {
   const uid = auth.currentUser?.uid;
-  if (!uid) return;
+  if (!uid || !cloudSession.canWrite(uid)) return;
   try {
     const userDocRef = doc(db, 'users', uid);
+    const current = useSettingsStore.getState();
+    const settingsData = sanitizeSettings({ ...current, ...(state || {}) });
     await setDoc(
       userDocRef,
-      { settings: state, lastSyncedAt: new Date().toISOString() },
+      { settings: settingsData, lastSyncedAt: new Date().toISOString() },
       { merge: true }
     );
   } catch (error) {
@@ -48,77 +66,82 @@ export const useSettingsStore = create<SettingsStore>()(
 
       setTheme: (theme) => {
         set({ theme });
-        syncSettingsToFirestore({ ...get(), theme });
+        syncSettingsToFirestore({ theme });
       },
 
       toggleTheme: () => {
         const nextTheme = get().theme === 'dark' ? 'light' : 'dark';
         set({ theme: nextTheme });
-        syncSettingsToFirestore({ ...get(), theme: nextTheme });
+        syncSettingsToFirestore({ theme: nextTheme });
       },
 
       toggleBeginnerMode: () => {
         const nextVal = !get().beginnerMode;
         set({ beginnerMode: nextVal });
-        syncSettingsToFirestore({ ...get(), beginnerMode: nextVal });
+        syncSettingsToFirestore({ beginnerMode: nextVal });
       },
 
       setDailyGoal: (minutes) => {
         set({ dailyGoalMinutes: minutes });
-        syncSettingsToFirestore({ ...get(), dailyGoalMinutes: minutes });
+        syncSettingsToFirestore({ dailyGoalMinutes: minutes });
       },
 
       setFontSize: (size) => {
         set({ fontSize: size });
-        syncSettingsToFirestore({ ...get(), fontSize: size });
+        syncSettingsToFirestore({ fontSize: size });
       },
 
       setUserName: (name) => {
         set({ userName: name });
-        syncSettingsToFirestore({ ...get(), userName: name });
+        syncSettingsToFirestore({ userName: name });
       },
 
       toggleNotifications: () => {
         const nextVal = !get().notifications;
         set({ notifications: nextVal });
-        syncSettingsToFirestore({ ...get(), notifications: nextVal });
+        syncSettingsToFirestore({ notifications: nextVal });
       },
 
-      resetSettings: () => {
+      resetSettings: (syncCloud = false) => {
+        if (!syncCloud) cloudSession.invalidate();
         set(defaultSettings);
-        syncSettingsToFirestore(defaultSettings);
+        if (syncCloud) {
+          syncSettingsToFirestore(defaultSettings);
+        }
       },
 
       syncToFirestore: async () => {
         await syncSettingsToFirestore(get());
       },
 
+      cancelCloudSync: () => cloudSession.invalidate(),
+
       loadFromFirestore: async (uid: string) => {
+        const request = cloudSession.beginLoad(uid);
         try {
+          if (!request.isCurrent()) return;
           const userDocRef = doc(db, 'users', uid);
-          const snap = await getDoc(userDocRef);
-          const localState = get();
+          const snap = await getDocFromServer(userDocRef);
+          if (!request.isCurrent()) return;
 
           if (snap.exists()) {
             const data = snap.data();
-            const cloudSettings = (data.settings || {}) as Partial<UserSettings>;
-            const merged: UserSettings = {
-              ...defaultSettings,
-              ...localState,
-              ...cloudSettings,
-            };
-            set(merged);
+            const rawSettings = (data?.settings && typeof data.settings === 'object')
+              ? data.settings
+              : data;
+            const cloudSettings = sanitizeSettings(rawSettings as Partial<UserSettings>);
+            set(cloudSettings);
           } else {
             const user = auth.currentUser;
-            const initial = {
-              ...localState,
-              userName: localState.userName === 'Learner' && user?.displayName ? user.displayName : localState.userName,
-            };
+            const initial = sanitizeSettings({
+              ...defaultSettings,
+              userName: user?.displayName || defaultSettings.userName,
+            });
             set(initial);
-            await setDoc(userDocRef, { settings: initial, lastSyncedAt: new Date().toISOString() }, { merge: true });
           }
+          request.complete();
         } catch (error) {
-          console.warn('Could not load settings from Firestore (using local storage):', error);
+          if (request.isCurrent()) throw error;
         }
       },
     }),

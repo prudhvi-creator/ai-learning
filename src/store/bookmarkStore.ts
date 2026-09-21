@@ -1,8 +1,11 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { db, auth } from '../lib/firebase';
-import type { BookmarkEntry, NoteEntry } from '../types/progress';
+import { doc, getDocFromServer, setDoc } from 'firebase/firestore';
+import { db, auth } from '../lib/firebase.ts';
+import { createCloudSession } from '../lib/cloudSession.ts';
+
+const cloudSession = createCloudSession(() => auth.currentUser?.uid);
+import type { BookmarkEntry, NoteEntry } from '../types/progress.ts';
 
 interface BookmarkStore {
   bookmarks: BookmarkEntry[];
@@ -14,18 +17,43 @@ interface BookmarkStore {
   getNote: (lessonId: string) => string;
   deleteNote: (lessonId: string) => void;
   loadFromFirestore: (uid: string) => Promise<void>;
-  resetBookmarks: () => void;
+  cancelCloudSync: () => void;
+  resetBookmarks: (syncCloud?: boolean) => void;
   syncToFirestore: () => Promise<void>;
 }
 
-const syncBookmarksToFirestore = async (bookmarks: BookmarkEntry[], notes: NoteEntry[]) => {
+export const sanitizeBookmarks = (bookmarks?: BookmarkEntry[] | null): BookmarkEntry[] => {
+  if (!Array.isArray(bookmarks)) return [];
+  return bookmarks
+    .filter((b) => b && typeof b.lessonId === 'string')
+    .map((b) => ({
+      lessonId: b.lessonId,
+      savedAt: typeof b.savedAt === 'string' ? b.savedAt : new Date().toISOString(),
+    }));
+};
+
+export const sanitizeNotes = (notes?: NoteEntry[] | null): NoteEntry[] => {
+  if (!Array.isArray(notes)) return [];
+  return notes
+    .filter((n) => n && typeof n.lessonId === 'string')
+    .map((n) => ({
+      lessonId: n.lessonId,
+      content: typeof n.content === 'string' ? n.content : '',
+      updatedAt: typeof n.updatedAt === 'string' ? n.updatedAt : new Date().toISOString(),
+    }));
+};
+
+const syncBookmarksToFirestore = async (bookmarks?: BookmarkEntry[], notes?: NoteEntry[]) => {
   const uid = auth.currentUser?.uid;
-  if (!uid) return;
+  if (!uid || !cloudSession.canWrite(uid)) return;
   try {
     const userDocRef = doc(db, 'users', uid);
+    const current = useBookmarkStore.getState();
+    const safeBookmarks = sanitizeBookmarks(bookmarks ?? current.bookmarks);
+    const safeNotes = sanitizeNotes(notes ?? current.notes);
     await setDoc(
       userDocRef,
-      { bookmarks, notes, lastSyncedAt: new Date().toISOString() },
+      { bookmarks: safeBookmarks, notes: safeNotes, lastSyncedAt: new Date().toISOString() },
       { merge: true }
     );
   } catch (error) {
@@ -90,9 +118,12 @@ export const useBookmarkStore = create<BookmarkStore>()(
         syncBookmarksToFirestore(state.bookmarks, nextNotes);
       },
 
-      resetBookmarks: () => {
+      resetBookmarks: (syncCloud = false) => {
+        if (!syncCloud) cloudSession.invalidate();
         set({ bookmarks: [], notes: [] });
-        syncBookmarksToFirestore([], []);
+        if (syncCloud) {
+          syncBookmarksToFirestore([], []);
+        }
       },
 
       syncToFirestore: async () => {
@@ -100,50 +131,29 @@ export const useBookmarkStore = create<BookmarkStore>()(
         await syncBookmarksToFirestore(state.bookmarks, state.notes);
       },
 
+      cancelCloudSync: () => cloudSession.invalidate(),
+
       loadFromFirestore: async (uid: string) => {
+        const request = cloudSession.beginLoad(uid);
         try {
+          if (!request.isCurrent()) return;
           const userDocRef = doc(db, 'users', uid);
-          const snap = await getDoc(userDocRef);
-          const localState = get();
+          const snap = await getDocFromServer(userDocRef);
+          if (!request.isCurrent()) return;
 
           if (snap.exists()) {
             const data = snap.data();
-            const cloudBookmarks = (Array.isArray(data.bookmarks) ? data.bookmarks : []) as BookmarkEntry[];
-            const cloudNotes = (Array.isArray(data.notes) ? data.notes : []) as NoteEntry[];
-
-            // Merge bookmarks (dedup by lessonId)
-            const bookmarkMap = new Map<string, BookmarkEntry>();
-            (localState.bookmarks || []).forEach((b) => bookmarkMap.set(b.lessonId, b));
-            cloudBookmarks.forEach((b) => bookmarkMap.set(b.lessonId, b));
-            const mergedBookmarks = Array.from(bookmarkMap.values());
-
-            // Merge notes (pick newer or non-empty content)
-            const noteMap = new Map<string, NoteEntry>();
-            (localState.notes || []).forEach((n) => noteMap.set(n.lessonId, n));
-            cloudNotes.forEach((n) => {
-              const existing = noteMap.get(n.lessonId);
-              if (!existing || (n.updatedAt && (!existing.updatedAt || n.updatedAt >= existing.updatedAt))) {
-                noteMap.set(n.lessonId, n);
-              }
-            });
-            const mergedNotes = Array.from(noteMap.values());
-
-            set({ bookmarks: mergedBookmarks, notes: mergedNotes });
-            await setDoc(
-              userDocRef,
-              { bookmarks: mergedBookmarks, notes: mergedNotes, lastSyncedAt: new Date().toISOString() },
-              { merge: true }
-            );
+            const cloudBookmarks = sanitizeBookmarks(data?.bookmarks);
+            const cloudNotes = sanitizeNotes(data?.notes);
+            set({ bookmarks: cloudBookmarks, notes: cloudNotes });
           } else {
-            // First time user, save current local bookmarks/notes to cloud
-            await setDoc(
-              userDocRef,
-              { bookmarks: localState.bookmarks, notes: localState.notes, lastSyncedAt: new Date().toISOString() },
-              { merge: true }
-            );
+            const safeBookmarks: BookmarkEntry[] = [];
+            const safeNotes: NoteEntry[] = [];
+            set({ bookmarks: safeBookmarks, notes: safeNotes });
           }
+          request.complete();
         } catch (error) {
-          console.warn('Could not load bookmarks from Firestore (using local storage):', error);
+          if (request.isCurrent()) throw error;
         }
       },
     }),
